@@ -2,6 +2,7 @@
 src/utils.py - Model loading, generation constants, seed management, and factories.
 """
 import json
+import math
 import os
 from typing import Any, Callable
 
@@ -261,3 +262,172 @@ def save_sc_scaling_curve(curve_list: list[dict[str, Any]], filepath: str = "out
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(curve_list, f, indent=2)
+
+
+# ===========================================================================
+# Additions (student implementation)
+# ===========================================================================
+def make_hf_batched_judge_fn(judge_model: Any, judge_tokenizer: Any, batch_size: int = 8):
+    """
+    Batched version of the judge: takes a LIST of raw judge prompts and returns a list
+    of {"text", "num_tokens"} dicts in the same order.
+
+    Why: the 7B judge is the bottleneck (~1,250 step verdicts for the full benchmark).
+    Batching 8 prompts per .generate() call cuts judging time several-fold on a T4.
+    Uses LEFT padding so every prompt ends exactly where generation starts; tokens are
+    counted from IDs after the (padded) prompt and sliced at the first EOS, exactly
+    like make_hf_judge_fn.
+
+    In the pipeline the outputs are put into a dict {prompt: output}, and score_path is
+    called with a judge_fn that looks prompts up in that dict, so the graded code path
+    (score_path -> build_prm_judge_prompt -> judge_fn -> parse_judge_decision) is unchanged.
+    """
+    import torch
+
+    eos_ids = _get_eos_token_ids(judge_model, judge_tokenizer)
+
+    def batched_judge_fn(prompts: list[str]) -> list[dict]:
+        if not prompts:
+            return []
+        formatted = [
+            judge_tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
+            )
+            for p in prompts
+        ]
+        # Sort by length to minimise padding, then restore order.
+        order = sorted(range(len(formatted)), key=lambda i: len(formatted[i]))
+        results: list[dict | None] = [None] * len(formatted)
+
+        old_side = judge_tokenizer.padding_side
+        judge_tokenizer.padding_side = "left"
+        try:
+            for b in range(0, len(order), batch_size):
+                idx = order[b:b + batch_size]
+                enc = judge_tokenizer([formatted[i] for i in idx], return_tensors="pt", padding=True)
+                enc = {k: v.to(judge_model.device) for k, v in enc.items()}
+                prompt_len = enc["input_ids"].shape[1]
+                kwargs = dict(JUDGE_GEN_KWARGS)
+                kwargs.setdefault("pad_token_id", judge_tokenizer.pad_token_id or judge_tokenizer.eos_token_id)
+                with torch.no_grad():
+                    out = judge_model.generate(**enc, **kwargs)
+                for row, i in enumerate(idx):
+                    gen_tokens = _slice_to_first_eos(out[row][prompt_len:], eos_ids)
+                    text = judge_tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                    results[i] = {"text": text, "num_tokens": len(gen_tokens)}
+        finally:
+            judge_tokenizer.padding_side = old_side
+        return results  # type: ignore[return-value]
+
+    return batched_judge_fn
+
+
+def make_verdict_prob_fn(judge_model: Any, judge_tokenizer: Any, batch_size: int = 8):
+    """
+    OPTIONAL BONUS (+3): continuous step confidence from the judge's logits.
+
+    For each (judge_prompt, judge_text) pair we take the judge's own generated text up to
+    and including its first "Verdict:" (or append "\\nVerdict:" if it never wrote one) and
+    compute the FULL-SEQUENCE log-probability of the two continuations " VALID" and
+    " INVALID" (summing log-probs over all of each continuation's tokens, so it does not
+    matter that the two words tokenize into different numbers of pieces). Then
+
+        p_valid = exp(lp_VALID) / (exp(lp_VALID) + exp(lp_INVALID))
+
+    State in the report that the full-sequence approach (not first-token) was used.
+    Returns fn(list[(prompt, judge_text)]) -> list[float].
+    """
+    import re as _re
+    import torch
+
+    verdict_re = _re.compile(r"verdict\s*:", _re.IGNORECASE)
+    conts = [" VALID", " INVALID"]
+
+    def _prefix(prompt: str, judge_text: str) -> str:
+        chat = judge_tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
+        )
+        m = verdict_re.search(judge_text or "")
+        if m:
+            assistant = judge_text[: m.end()]
+        else:
+            assistant = (judge_text or "").rstrip() + "\nVerdict:"
+        return chat + assistant
+
+    def prob_fn(items: list[tuple[str, str]]) -> list[float]:
+        # Build 2 sequences per item: prefix+" VALID", prefix+" INVALID".
+        seqs, spans = [], []
+        for prompt, text in items:
+            pre = _prefix(prompt, text)
+            pre_ids = judge_tokenizer(pre, add_special_tokens=False)["input_ids"]
+            for c in conts:
+                full_ids = judge_tokenizer(pre + c, add_special_tokens=False)["input_ids"]
+                # continuation tokens = everything after the shared prefix
+                k = 0
+                while k < min(len(pre_ids), len(full_ids)) and pre_ids[k] == full_ids[k]:
+                    k += 1
+                seqs.append(full_ids)
+                spans.append(k)
+
+        logps: list[float] = []
+        pad_id = judge_tokenizer.pad_token_id or judge_tokenizer.eos_token_id
+        for b in range(0, len(seqs), 2 * batch_size):
+            chunk = seqs[b:b + 2 * batch_size]
+            chunk_spans = spans[b:b + 2 * batch_size]
+            L = max(len(s) for s in chunk)
+            ids = torch.full((len(chunk), L), pad_id, dtype=torch.long)
+            mask = torch.zeros((len(chunk), L), dtype=torch.long)
+            for r, s in enumerate(chunk):  # right padding: positions stay aligned
+                ids[r, : len(s)] = torch.tensor(s)
+                mask[r, : len(s)] = 1
+            ids, mask = ids.to(judge_model.device), mask.to(judge_model.device)
+            # Run the transformer body only, then apply lm_head at the handful of positions
+            # we need. Full logits would be (batch x seq_len x 152k vocab) and OOM a T4.
+            base = getattr(judge_model, "model", None) or judge_model.get_decoder()
+            lm_head = judge_model.get_output_embeddings()
+            with torch.no_grad():
+                hidden = base(input_ids=ids, attention_mask=mask).last_hidden_state
+                for r, s in enumerate(chunk):
+                    start = max(1, chunk_spans[r])
+                    positions = list(range(start - 1, len(s) - 1))  # token at p+1 predicted at p
+                    if not positions:
+                        logps.append(0.0)
+                        continue
+                    h = hidden[r, positions].to(lm_head.weight.dtype)
+                    lp = torch.log_softmax(lm_head(h).float(), dim=-1)
+                    targets = torch.tensor(s[start:], device=lp.device)
+                    logps.append(lp.gather(1, targets[:, None]).sum().item())
+
+        probs = []
+        for i in range(0, len(logps), 2):
+            lv, li = logps[i], logps[i + 1]
+            m = max(lv, li)
+            ev, ei = math.exp(lv - m), math.exp(li - m)
+            probs.append(ev / (ev + ei))
+        return probs
+
+    return prob_fn
+
+
+def write_jsonl_line(path: str, record: dict) -> None:
+    """Appends one JSON record and flushes (checkpointing for Kaggle disconnects)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def read_jsonl(path: str) -> list[dict]:
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass  # a half-written last line after a crash is skipped
+    return rows
